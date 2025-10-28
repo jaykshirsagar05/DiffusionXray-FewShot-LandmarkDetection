@@ -15,6 +15,15 @@ Install python packages
 pip install -r requirements.txt
 ```
 
+## 3D Data Support
+
+This framework now supports both 2D images (original functionality) and 3D volumetric data. For detailed information on using 3D data, see [ddpm_pretraining/3D_USAGE.md](ddpm_pretraining/3D_USAGE.md).
+
+To use 3D mode:
+1. Set `"is_3d": true` in your configuration file
+2. Prepare your 3D volumetric data (NIfTI or NumPy format)
+3. Use the provided `config_3d.json` as a template
+
 ## Preparing Datasets
 Download the cephalometric ([link1](https://figshare.com/s/37ec464af8e81ae6ebbf), [link2](https://www.kaggle.com/datasets/c34a0ef0cd3cfd5c5afbdb30f8541e887171f19f196b1ad63790ca5b28c0ec93?select=cepha400)), hand [link](https://ipilab.usc.edu/research/baaweb/) and the chest [link](https://www.kaggle.com/datasets/nikhilpandey360/chest-xray-masks-and-labels) datasets.
 
