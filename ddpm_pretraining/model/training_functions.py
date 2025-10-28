@@ -31,6 +31,9 @@ from model.ddpm_model import DDPM
 
 def initialize_ddpm(config: Dict[str, Any], phase: str, device: torch.device) -> DDPM:
     
+    # Get is_3d from config, default to False for backward compatibility
+    is_3d = config.get("is_3d", False)
+    
     if phase == "train":
         ddpm = DDPM(
             image_size=config["dataset"]["image_size"],
@@ -48,6 +51,7 @@ def initialize_ddpm(config: Dict[str, Any], phase: str, device: torch.device) ->
             unet_att_heads=config["model"]["unet"]["num_head_channels"],
             unet_att_res=config["model"]["unet"]["attn_res"],
             use_ema=config["model"]["use_ema"],
+            is_3d=is_3d,
         )
         
     elif phase == "test":
@@ -66,6 +70,7 @@ def initialize_ddpm(config: Dict[str, Any], phase: str, device: torch.device) ->
             unet_res_blocks=config["model"]["unet"]["res_blocks"],
             unet_att_heads=config["model"]["unet"]["num_head_channels"],
             unet_att_res=config["model"]["unet"]["attn_res"],
+            is_3d=is_3d,
         )
     else:
         raise ValueError(f"Phase {phase} is not valid. Must be either 'train' or 'test'")

@@ -2,6 +2,7 @@ albumentations==1.4.4
 einops==0.8.0
 GPUtil==1.4.0
 matplotlib==3.8.2
+nibabel==5.1.0
 numpy==1.23.5
 opencv_python==4.9.0.80
 opencv_python_headless==4.9.0.80

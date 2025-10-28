@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 import albumentations as A
 
 # Custom libraries
-from ddpm_datasets import ChestDiffusionDataset, HandDiffusionDataset, CephaloDiffusionDataset
+from ddpm_datasets import ChestDiffusionDataset, HandDiffusionDataset, CephaloDiffusionDataset, Volume3DDiffusionDataset
 
 # ------------------------------------------------------------------------
 #                               Logging and Utilities
@@ -150,23 +150,28 @@ def get_transforms(image_size, phase='train'):
         raise ValueError('phase must be either "train" or "test"')
 
 
-def load_data(dataset_path, image_size, image_channels, batch_size, pin_memory=False, num_workers = os.cpu_count()):    
+def load_data(dataset_path, image_size, image_channels, batch_size, pin_memory=False, num_workers = os.cpu_count(), is_3d=False):    
     dataset_name = os.path.basename(dataset_path)
     
-    transforms_train = get_transforms(image_size, phase='train')
-    transforms_test = get_transforms(image_size, phase='test')
-    
-    if dataset_name == 'chest':
-        train_dataset = ChestDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_train, phase='train')
-        test_dataset = ChestDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_test, phase='test')
-    elif dataset_name == 'hand':
-        train_dataset = HandDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_train, phase='train')
-        test_dataset = HandDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_test, phase='test')
-    elif dataset_name == 'cephalo':
-        train_dataset = CephaloDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_train, phase='train')
-        test_dataset = CephaloDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_test, phase='test')
+    if is_3d:
+        # For 3D datasets, no augmentation transforms (just normalization handled in dataset)
+        train_dataset = Volume3DDiffusionDataset(dataset_path, channels=image_channels, volume_size=image_size, transform=None, phase='train')
+        test_dataset = Volume3DDiffusionDataset(dataset_path, channels=image_channels, volume_size=image_size, transform=None, phase='test')
     else:
-        raise ValueError('Dataset name must be either "chest" or "hand" or "cephalo"')
+        transforms_train = get_transforms(image_size, phase='train')
+        transforms_test = get_transforms(image_size, phase='test')
+        
+        if dataset_name == 'chest':
+            train_dataset = ChestDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_train, phase='train')
+            test_dataset = ChestDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_test, phase='test')
+        elif dataset_name == 'hand':
+            train_dataset = HandDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_train, phase='train')
+            test_dataset = HandDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_test, phase='test')
+        elif dataset_name == 'cephalo':
+            train_dataset = CephaloDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_train, phase='train')
+            test_dataset = CephaloDiffusionDataset(dataset_path, channels=image_channels, transform=transforms_test, phase='test')
+        else:
+            raise ValueError('Dataset name must be either "chest" or "hand" or "cephalo"')
     
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, drop_last=True)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory, drop_last=False)

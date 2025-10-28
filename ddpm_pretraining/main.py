@@ -71,9 +71,10 @@ if __name__ == "__main__":
     image_channels = config["dataset"]["image_channels"]
     pin_memory = config["dataset"]["pin_memory"]
     num_workers = 2 if config["dataset"]["num_workers"] == None else config["dataset"]["num_workers"]
+    is_3d = config.get("is_3d", False)
 
     # Create train and test dataloaders
-    train_dataloader, test_dataloader = load_data(DATASET_PATH, image_size, image_channels, batch_size, pin_memory=pin_memory, num_workers=num_workers)
+    train_dataloader, test_dataloader = load_data(DATASET_PATH, image_size, image_channels, batch_size, pin_memory=pin_memory, num_workers=num_workers, is_3d=is_3d)
 
     # Save model path and tensorboard writer and path for the experiment
     PREFIX_PATH = f"{root_path}/{DATASET_NAME}/{config['model']['beta_schedule']['train']['schedule']}_{config['model']['beta_schedule']['train']['n_timestep']}/size{image_size}_ch{image_channels}"
