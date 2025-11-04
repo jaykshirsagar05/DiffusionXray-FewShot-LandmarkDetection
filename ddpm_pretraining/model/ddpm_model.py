@@ -36,6 +36,7 @@ class DDPM:
         unet_att_heads: int = 4,
         unet_res_blocks: int = 4,
         use_ema: bool = False,
+        is_3d: bool = False,
     ):
 
         self.timesteps = timesteps
@@ -43,6 +44,7 @@ class DDPM:
         self.image_size = image_size
         self.channels = channels
         self.lr = lr
+        self.is_3d = is_3d
 
         self.beta_start = beta_start
         self.beta_end = beta_end
@@ -63,6 +65,7 @@ class DDPM:
             resnet_block_groups=unet_res_blocks,
             att_heads=unet_att_heads,
             att_res=unet_att_res,
+            is_3d=is_3d,
         )
         self.model.to(self.device)
 
@@ -111,8 +114,12 @@ class DDPM:
 
 
     def noise_images(self, x, t):
-        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
-        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
+        if self.is_3d:
+            sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None, None]
+            sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None, None]
+        else:
+            sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
+            sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
         Ɛ = torch.randn_like(x)
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ
     
@@ -151,17 +158,25 @@ class DDPM:
                 timesteps = self.timesteps
 
             if x_cond is None:
-                x = torch.randn((batch_size, self.channels, self.image_size, self.image_size)).to(self.device)
+                if self.is_3d:
+                    x = torch.randn((batch_size, self.channels, self.image_size, self.image_size, self.image_size)).to(self.device)
+                else:
+                    x = torch.randn((batch_size, self.channels, self.image_size, self.image_size)).to(self.device)
             else:
                 x,_ = self.noise_images_conditioned(x_cond, timesteps-1)
 
             for i in tqdm(reversed(range(1, timesteps)), position=0):
                 t = (torch.ones(batch_size) * i).long().to(self.device)
                 predicted_noise = model(x, t)
-                alpha = self.alpha[t][:, None, None, None]
-                alpha_hat = self.alpha_hat[t][:, None, None, None]
+                if self.is_3d:
+                    alpha = self.alpha[t][:, None, None, None, None]
+                    alpha_hat = self.alpha_hat[t][:, None, None, None, None]
+                    beta = self.beta[t][:, None, None, None, None]
+                else:
+                    alpha = self.alpha[t][:, None, None, None]
+                    alpha_hat = self.alpha_hat[t][:, None, None, None]
+                    beta = self.beta[t][:, None, None, None]
 
-                beta = self.beta[t][:, None, None, None]
                 if i > 1:
                     noise = torch.randn_like(x)
                 else:
