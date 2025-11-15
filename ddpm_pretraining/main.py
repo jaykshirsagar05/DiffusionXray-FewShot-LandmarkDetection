@@ -1,4 +1,3 @@
-
 # ------------------------------------------------------------------------
 #                               Libraries 
 # ------------------------------------------------------------------------
@@ -97,7 +96,13 @@ if __name__ == "__main__":
     print(f"Dataset size: {len(train_dataloader.dataset)}")
     print(f"Batch size: {batch_size} | Accumulation steps: {config['dataset']['grad_accumulation']}")
     print(f"Number of batches: {len(train_dataloader)}")
-    print(f"Image shape: ({image_size}, {image_size}, {image_channels})")
+    # Print image shape in the dataset's natural layout (Height x Width x Channels for 2D,
+    # Depth x Height x Width x Channels for 3D), for readability
+    if is_3d:
+        print(f"Image shape: ({image_size}, {image_size}, {image_size}, {image_channels}) (Depth x Height x Width x Channels)")
+    else:
+        print(f"Image shape: ({image_size}, {image_size}, {image_channels}) (Height x Width x Channels)")
+    print(f"3D data?: {is_3d}")
     print(f"Save model path: {save_model_path}")
     print("------------------------------------------------------------------------------------------------")
     
@@ -107,4 +112,3 @@ if __name__ == "__main__":
     train_diffusion_model(config, train_dataloader, save_model_path, PREFIX_PATH, device, continue_training=config["model"]["continue_training"])
 
     print("----------------------------------------- END TRAINING -----------------------------------------")
-    

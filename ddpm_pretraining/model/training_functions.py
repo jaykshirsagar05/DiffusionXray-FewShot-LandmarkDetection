@@ -1,5 +1,3 @@
-
-
 # ------------------------------------------------------------------------
 #                               Libraries
 # ------------------------------------------------------------------------
@@ -233,8 +231,16 @@ def train_diffusion_model(config, train_dataloader, save_model_path, root_path, 
                     mse_metric = mse(x_hat, x)
                     
                     # Compute FID
-                    real_images = x if channels == 3 else x.repeat(1, 3, 1, 1)
-                    fake_images = x_hat if channels == 3 else x_hat.repeat(1, 3, 1, 1)
+                    if ddpm.is_3d:
+                        # For 3D, take the middle slice and repeat channels
+                        middle_slice = x.shape[2] // 2
+                        real_images_slice = x[:, :, middle_slice, :, :]
+                        fake_images_slice = x_hat[:, :, middle_slice, :, :]
+                        real_images = real_images_slice if channels == 3 else real_images_slice.repeat(1, 3, 1, 1)
+                        fake_images = fake_images_slice if channels == 3 else fake_images_slice.repeat(1, 3, 1, 1)
+                    else:
+                        real_images = x if channels == 3 else x.repeat(1, 3, 1, 1)
+                        fake_images = x_hat if channels == 3 else x_hat.repeat(1, 3, 1, 1)
 
                     fid.update(real_images, real=True)
                     fid.update(fake_images.clamp(0, 1), real=False)
@@ -272,7 +278,12 @@ def train_diffusion_model(config, train_dataloader, save_model_path, root_path, 
 
                         ema_x_hat_min, ema_x_hat_max = check_pixels_range_of_image(ema_x_hat)
                         
-                        ema_fake_images = ema_x_hat if channels == 3 else ema_x_hat.repeat(1, 3, 1, 1)
+                        if ddpm.is_3d:
+                            middle_slice = x.shape[2] // 2
+                            ema_fake_images_slice = ema_x_hat[:, :, middle_slice, :, :]
+                            ema_fake_images = ema_fake_images_slice if channels == 3 else ema_fake_images_slice.repeat(1, 3, 1, 1)
+                        else:
+                            ema_fake_images = ema_x_hat if channels == 3 else ema_x_hat.repeat(1, 3, 1, 1)
                         
                         fid.update(ema_fake_images.clamp(0, 1), real=False)
                         ema_fid_score = fid.compute()
@@ -297,7 +308,9 @@ def train_diffusion_model(config, train_dataloader, save_model_path, root_path, 
                                         
                     
                     # Delete tensors from GPU
-                    del x, x_hat, real_images, fake_images, diff, ema_x_hat, ema_fake_images, ema_diff
+                    del x, x_hat, real_images, fake_images, diff
+                    if use_ema:
+                        del ema_x_hat, ema_fake_images, ema_diff
                     
                     # Log and print message
                     print(message)

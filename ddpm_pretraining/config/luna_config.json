@@ -1,0 +1,47 @@
+{
+    "gpu": 0,
+    "experiment_path": "ddpm_pretraining/ddpm_pretraining_experiments",
+    "model_for_inference": "",
+    "is_3d": true,
+    "model": {
+        "unet": {
+            "channel_mults": [1, 2, 4],
+            "attn_res": 16,
+            "num_head_channels": 4,
+            "res_blocks": 2,
+            "self_condition": false
+        },
+        "beta_schedule": {
+            "train": {
+                "schedule": "linear",
+                "n_timestep": 20,
+                "linear_start": 1e-4,
+                "linear_end": 0.02
+            },
+            "test": {
+                "schedule": "linear",
+                "n_timestep": 20,
+                "linear_start": 1e-4,
+                "linear_end": 0.02
+            }
+        },
+        "lr": 1e-4,
+        "optimizer": "adamw",
+        "loss_type": "l2",
+        "use_ema": false,
+        "iterations": 100,
+        "freq_metrics": 10,
+        "freq_checkpoint": 10,
+        "continue_training": false
+    },
+    "dataset": {
+        "name": "LUNA16",
+        "path": "/q/AVC-AI/jkshirsagar/CSI_Project/",
+        "image_size": 32,
+        "image_channels": 1,
+        "batch_size": 2,
+        "grad_accumulation": 4,
+        "num_workers": 2,
+        "pin_memory": true
+    }
+}

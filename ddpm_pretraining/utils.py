@@ -1,4 +1,3 @@
-
 # ------------------------------------------------------------------------
 #                               Libraries
 # ------------------------------------------------------------------------
@@ -16,7 +15,7 @@ from torch.utils.data import DataLoader
 import albumentations as A
 
 # Custom libraries
-from ddpm_datasets import ChestDiffusionDataset, HandDiffusionDataset, CephaloDiffusionDataset, Volume3DDiffusionDataset
+from ddpm_datasets import ChestDiffusionDataset, HandDiffusionDataset, CephaloDiffusionDataset, Volume3DDiffusionDataset, LUNA16DiffusionDataset
 
 # ------------------------------------------------------------------------
 #                               Logging and Utilities
@@ -150,14 +149,41 @@ def get_transforms(image_size, phase='train'):
         raise ValueError('phase must be either "train" or "test"')
 
 
-def load_data(dataset_path, image_size, image_channels, batch_size, pin_memory=False, num_workers = os.cpu_count(), is_3d=False):    
+def load_data(dataset_path, image_size, image_channels, batch_size, pin_memory=False, num_workers = None, is_3d=False):    
     dataset_name = os.path.basename(dataset_path)
     
+    # 3D datasets
     if is_3d:
-        # For 3D datasets, no augmentation transforms (just normalization handled in dataset)
-        train_dataset = Volume3DDiffusionDataset(dataset_path, channels=image_channels, volume_size=image_size, transform=None, phase='train')
-        test_dataset = Volume3DDiffusionDataset(dataset_path, channels=image_channels, volume_size=image_size, transform=None, phase='test')
+        if dataset_name == "volume3d":
+            train_dataset = Volume3DDiffusionDataset(
+                root_dir=dataset_path,
+                channels=image_channels,
+                volume_size=image_size,
+                phase='train'
+            )
+            test_dataset = Volume3DDiffusionDataset(
+                root_dir=dataset_path,
+                channels=image_channels,
+                volume_size=image_size,
+                phase='test'
+            )
+        elif dataset_name == "LUNA16":
+            train_dataset = LUNA16DiffusionDataset(
+                root_dir=dataset_path,
+                channels=image_channels,
+                volume_size=image_size,
+                phase='train'
+            )
+            test_dataset = LUNA16DiffusionDataset(
+                root_dir=dataset_path,
+                channels=image_channels,
+                volume_size=image_size,
+                phase='test'
+            )
+        else:
+            raise ValueError(f"Unknown 3D dataset: {dataset_name}")
     else:
+        # 2D datasets (existing code)
         transforms_train = get_transforms(image_size, phase='train')
         transforms_test = get_transforms(image_size, phase='test')
         

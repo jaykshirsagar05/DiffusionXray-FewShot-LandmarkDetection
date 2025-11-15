@@ -11,8 +11,6 @@ from tqdm import tqdm
 import logging
 from model.nn_blocks import *
 from torch.optim import Adam, AdamW, SGD
-from torchmetrics.image import StructuralSimilarityIndexMeasure
-from torchmetrics import MeanSquaredError
 from torchvision.utils import make_grid
 import matplotlib.pyplot as plt
 import numpy as np
@@ -114,6 +112,10 @@ class DDPM:
 
 
     def noise_images(self, x, t):
+        # Ensure t is always at least 1D
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        
         if self.is_3d:
             sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None, None]
             sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None, None]
@@ -124,8 +126,16 @@ class DDPM:
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ
     
     def noise_images_conditioned(self, x, t):
-        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])
-        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])
+        # Ensure t is always at least 1D
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        
+        if self.is_3d:
+            sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None, None]
+            sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None, None]
+        else:
+            sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
+            sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
         Ɛ = torch.randn_like(x)
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ
 
@@ -163,7 +173,9 @@ class DDPM:
                 else:
                     x = torch.randn((batch_size, self.channels, self.image_size, self.image_size)).to(self.device)
             else:
-                x,_ = self.noise_images_conditioned(x_cond, timesteps-1)
+                # FIX: Ensure t is always 1D tensor, even for batch_size=1
+                t_cond = torch.full((batch_size,), timesteps-1, dtype=torch.long, device=self.device)
+                x,_ = self.noise_images_conditioned(x_cond, t_cond)
 
             for i in tqdm(reversed(range(1, timesteps)), position=0):
                 t = (torch.ones(batch_size) * i).long().to(self.device)
@@ -187,14 +199,27 @@ class DDPM:
     
     @torch.no_grad()
     def save_noising_process_image(self, x_start, filename):
-
-        images = [x_start[0:1]] # Select the first image from the batch
         timesteps_to_visualize = [i for i in range(0, self.timesteps, self.timesteps // 10)]
         
-        for t in timesteps_to_visualize:
-            t_tensor = torch.tensor([t], device=self.device)
-            noised_image, _ = self.noise_images(x_start, t_tensor)
-            images.append(noised_image[0:1]) # Select the first image from the batch
+        if self.is_3d:
+            # For 3D, visualize middle slice
+            middle_slice = x_start.shape[2] // 2
+            images = [x_start[0:1, :, middle_slice:middle_slice+1, :, :].squeeze(2)]
+            
+            for t in timesteps_to_visualize:
+                t_tensor = torch.tensor([t], device=self.device)  # Ensure 1D tensor
+                noised_image, _ = self.noise_images(x_start, t_tensor)
+                # Extract middle slice and remove depth dimension
+                slice_img = noised_image[0:1, :, middle_slice:middle_slice+1, :, :].squeeze(2)
+                images.append(slice_img)
+        else:
+            # Original 2D implementation
+            images = [x_start[0:1]]
+            
+            for t in timesteps_to_visualize:
+                t_tensor = torch.tensor([t], device=self.device)  # Ensure 1D tensor
+                noised_image, _ = self.noise_images(x_start, t_tensor)
+                images.append(noised_image[0:1])
 
         # Create a grid of images
         image_grid = make_grid(torch.cat(images), nrow=len(timesteps_to_visualize) + 1, normalize=False)
@@ -205,7 +230,7 @@ class DDPM:
 
         # Plot and save the image
         plt.figure(figsize=(len(images) * 2, 2))
-        plt.imshow(np_image_grid)
+        plt.imshow(np_image_grid, cmap='gray' if self.channels == 1 else None)
         plt.axis('off')
         plt.savefig(filename, bbox_inches='tight')
         plt.close()
