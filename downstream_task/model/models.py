@@ -73,15 +73,25 @@ class Residual(nn.Module):
         return self.fn(x, *args, **kwargs) + x
 
 
-def Upsample(dim, dim_out=None):
+def Upsample(dim, dim_out=None, is_3d=False):
+    if is_3d:
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv3d(dim, default(dim_out, dim), 3, padding=1),
+        )
     return nn.Sequential(
         nn.Upsample(scale_factor=2, mode="nearest"),
         nn.Conv2d(dim, default(dim_out, dim), 3, padding=1),
     )
 
 
-def Downsample(dim, dim_out=None):
+def Downsample(dim, dim_out=None, is_3d=False):
     # No More Strided Convolutions or Pooling
+    if is_3d:
+        return nn.Sequential(
+            Rearrange("b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w", p1=2, p2=2, p3=2),
+            nn.Conv3d(dim * 8, default(dim_out, dim), 1),
+        )
     return nn.Sequential(
         Rearrange("b c (h p1) (w p2) -> b (c p1 p2) h w", p1=2, p2=2),
         nn.Conv2d(dim * 4, default(dim_out, dim), 1),
@@ -128,10 +138,39 @@ class WeightStandardizedConv2d(nn.Conv2d):
         )
 
 
+class WeightStandardizedConv3d(nn.Conv3d):
+    """
+    3D version of WeightStandardizedConv2d
+    https://arxiv.org/abs/1903.10520
+    weight standardization purportedly works synergistically with group normalization
+    """
+
+    def forward(self, x):
+        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
+
+        weight = self.weight
+        mean = reduce(weight, "o ... -> o 1 1 1 1", "mean")
+        var = reduce(weight, "o ... -> o 1 1 1 1", partial(torch.var, unbiased=False))
+        normalized_weight = (weight - mean) * (var + eps).rsqrt()
+
+        return F.conv3d(
+            x,
+            normalized_weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+
+
 class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups=8):
+    def __init__(self, dim, dim_out, groups=8, is_3d=False):
         super().__init__()
-        self.proj = WeightStandardizedConv2d(dim, dim_out, 3, padding=1)
+        if is_3d:
+            self.proj = WeightStandardizedConv3d(dim, dim_out, 3, padding=1)
+        else:
+            self.proj = WeightStandardizedConv2d(dim, dim_out, 3, padding=1)
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -150,7 +189,7 @@ class Block(nn.Module):
 class ResnetBlock(nn.Module):
     """https://arxiv.org/abs/1512.03385"""
 
-    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8, is_3d=False):
         super().__init__()
         self.mlp = (
             nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out * 2))
@@ -158,15 +197,21 @@ class ResnetBlock(nn.Module):
             else None
         )
 
-        self.block1 = Block(dim, dim_out, groups=groups)
-        self.block2 = Block(dim_out, dim_out, groups=groups)
-        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.block1 = Block(dim, dim_out, groups=groups, is_3d=is_3d)
+        self.block2 = Block(dim_out, dim_out, groups=groups, is_3d=is_3d)
+        if is_3d:
+            self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        else:
+            self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb=None):
         scale_shift = None
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, "b c -> b c 1 1")
+            if len(x.shape) == 5:  # 3D case: (b, c, d, h, w)
+                time_emb = rearrange(time_emb, "b c -> b c 1 1 1")
+            else:  # 2D case: (b, c, h, w)
+                time_emb = rearrange(time_emb, "b c -> b c 1 1")
             scale_shift = time_emb.chunk(2, dim=1)
 
         h = self.block1(x, scale_shift=scale_shift)
@@ -175,20 +220,32 @@ class ResnetBlock(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32):
+    def __init__(self, dim, heads=4, dim_head=32, is_3d=False):
         super().__init__()
         self.scale = dim_head**-0.5
         self.heads = heads
+        self.is_3d = is_3d
         hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+        if is_3d:
+            self.to_qkv = nn.Conv3d(dim, hidden_dim * 3, 1, bias=False)
+            self.to_out = nn.Conv3d(hidden_dim, dim, 1)
+        else:
+            self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
+            self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
     def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(
-            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
-        )
+        if self.is_3d:
+            b, c, d, h, w = x.shape
+            qkv = self.to_qkv(x).chunk(3, dim=1)
+            q, k, v = map(
+                lambda t: rearrange(t, "b (h c) d x y -> b h c (d x y)", h=self.heads), qkv
+            )
+        else:
+            b, c, h, w = x.shape
+            qkv = self.to_qkv(x).chunk(3, dim=1)
+            q, k, v = map(
+                lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
+            )
         q = q * self.scale
 
         sim = einsum("b h d i, b h d j -> b h i j", q, k)
@@ -196,26 +253,40 @@ class Attention(nn.Module):
         attn = sim.softmax(dim=-1)
 
         out = einsum("b h i j, b h d j -> b h i d", attn, v)
-        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
+        if self.is_3d:
+            out = rearrange(out, "b h (d x y) c -> b (h c) d x y", d=d, x=h, y=w)
+        else:
+            out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
         return self.to_out(out)
 
 
 class LinearAttention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32):
+    def __init__(self, dim, heads=4, dim_head=32, is_3d=False):
         super().__init__()
         self.scale = dim_head**-0.5
         self.heads = heads
+        self.is_3d = is_3d
         hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-
-        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), nn.GroupNorm(1, dim))
+        if is_3d:
+            self.to_qkv = nn.Conv3d(dim, hidden_dim * 3, 1, bias=False)
+            self.to_out = nn.Sequential(nn.Conv3d(hidden_dim, dim, 1), nn.GroupNorm(1, dim))
+        else:
+            self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
+            self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), nn.GroupNorm(1, dim))
 
     def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(
-            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
-        )
+        if self.is_3d:
+            b, c, d, h, w = x.shape
+            qkv = self.to_qkv(x).chunk(3, dim=1)
+            q, k, v = map(
+                lambda t: rearrange(t, "b (h c) d x y -> b h c (d x y)", h=self.heads), qkv
+            )
+        else:
+            b, c, h, w = x.shape
+            qkv = self.to_qkv(x).chunk(3, dim=1)
+            q, k, v = map(
+                lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
+            )
 
         q = q.softmax(dim=-2)
         k = k.softmax(dim=-1)
@@ -224,7 +295,10 @@ class LinearAttention(nn.Module):
         context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
 
         out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
-        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
+        if self.is_3d:
+            out = rearrange(out, "b h c (d x y) -> b (h c) d x y", h=self.heads, d=d, x=h, y=w)
+        else:
+            out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
         return self.to_out(out)
 
 
@@ -256,24 +330,31 @@ class Unet(nn.Module):
         resnet_block_groups=4,
         att_res=32,
         att_heads=4,
+        is_3d=False,
     ):
         super().__init__()
 
         # determine dimensions
         self.channels = channels
         self.self_condition = self_condition
+        self.is_3d = is_3d
         # input_channels = channels * (2 if self_condition else 1)
         input_channels = channels if not self_condition else channels + 1
 
         init_dim = default(init_dim, dim)
-        self.init_conv = nn.Conv2d(
-            input_channels, init_dim, 1, padding=0
-        )  # changed to 1 and 0 from 7,3
+        if is_3d:
+            self.init_conv = nn.Conv3d(
+                input_channels, init_dim, 1, padding=0
+            )  # changed to 1 and 0 from 7,3
+        else:
+            self.init_conv = nn.Conv2d(
+                input_channels, init_dim, 1, padding=0
+            )  # changed to 1 and 0 from 7,3
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        block_klass = partial(ResnetBlock, groups=resnet_block_groups)
+        block_klass = partial(ResnetBlock, groups=resnet_block_groups, is_3d=is_3d)
 
         # time embeddings
         time_dim = dim * 4
@@ -299,11 +380,11 @@ class Unet(nn.Module):
                         block_klass(dim_in, dim_in, time_emb_dim=time_dim),
                         block_klass(dim_in, dim_in, time_emb_dim=time_dim),
                         Residual(
-                            PreNorm(dim_in, LinearAttention(dim_in, att_heads, att_res))
+                            PreNorm(dim_in, LinearAttention(dim_in, att_heads, att_res, is_3d=is_3d))
                         ),
-                        Downsample(dim_in, dim_out)
+                        Downsample(dim_in, dim_out, is_3d=is_3d)
                         if not is_last
-                        else nn.Conv2d(dim_in, dim_out, 3, padding=1),
+                        else (nn.Conv3d(dim_in, dim_out, 3, padding=1) if is_3d else nn.Conv2d(dim_in, dim_out, 3, padding=1)),
                     ]
                 )
             )
@@ -311,7 +392,7 @@ class Unet(nn.Module):
         mid_dim = dims[-1]
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
         self.mid_attn = Residual(
-            PreNorm(mid_dim, Attention(mid_dim, att_heads, att_res))
+            PreNorm(mid_dim, Attention(mid_dim, att_heads, att_res, is_3d=is_3d))
         )
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
 
@@ -325,12 +406,12 @@ class Unet(nn.Module):
                         block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
                         Residual(
                             PreNorm(
-                                dim_out, LinearAttention(dim_out, att_heads, att_res)
+                                dim_out, LinearAttention(dim_out, att_heads, att_res, is_3d=is_3d)
                             )
                         ),
-                        Upsample(dim_out, dim_in)
+                        Upsample(dim_out, dim_in, is_3d=is_3d)
                         if not is_last
-                        else nn.Conv2d(dim_out, dim_in, 3, padding=1),
+                        else (nn.Conv3d(dim_out, dim_in, 3, padding=1) if is_3d else nn.Conv2d(dim_out, dim_in, 3, padding=1)),
                     ]
                 )
             )
@@ -338,7 +419,10 @@ class Unet(nn.Module):
         self.out_dim = default(out_dim, channels)
 
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
-        self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
+        if is_3d:
+            self.final_conv = nn.Conv3d(dim, self.out_dim, 1)
+        else:
+            self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
 
     def forward(self, x, time=None, x_self_cond=None, checkpointing=True):

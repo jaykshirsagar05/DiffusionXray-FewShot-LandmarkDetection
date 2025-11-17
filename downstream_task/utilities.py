@@ -251,3 +251,124 @@ def send_telegram_message(text, env_file='~/.env'):
     return response
         
         
+## -----------------------------------------------------------------------------------------------------------------##
+##                            3D HEATMAPS GENERATION FROM LANDMARKS POINTS                                          ##
+## -----------------------------------------------------------------------------------------------------------------##
+
+def fuse_heatmaps_3d(heatmaps):
+    """Fuse multiple 3D heatmaps into one by taking maximum value at each voxel."""
+    fused_heatmap = np.maximum.reduce(heatmaps)
+    return fused_heatmap
+
+def scale_points_3d(points: list, vol_size: tuple, orig_size: tuple = None, offset=0):    
+    """
+    Scale 3D coordinates according to volume size.
+    Args:
+        points: List of 3D points (x, y, z)
+        vol_size: Target volume size (D, H, W)
+        orig_size: Original volume size (optional)
+        offset: Offset to add to scaled points
+    """
+    if orig_size:
+        # Points * Ratio -> Downscaling
+        scaled_points = [tuple([round(p*vsize/osize)+offset for p, vsize, osize in zip(point, vol_size, orig_size)]) for point in points]
+    else:
+        # Points * current Size -> Upscaling (when points are normalized to [0, 1])
+        scaled_points = [tuple([round(r*sz)+offset for sz, r in zip(vol_size, point)]) for point in points]
+
+    return scaled_points
+
+
+def points_to_heatmap_3d(points: list, vol_size: tuple, orig_size: tuple = None, sigma=2, fuse=False, offset=0):
+    """
+    Generate 3D heatmaps from landmark points.
+    Args:
+        points: List of 3D landmark points (normalized or absolute)
+        vol_size: Target volume size (D, H, W)
+        orig_size: Original volume size (optional)
+        sigma: Standard deviation for Gaussian heatmap
+        fuse: Whether to fuse all heatmaps into one
+        offset: Offset to add to scaled points
+    Returns:
+        Array of 3D heatmaps, shape (N, D, H, W) or (D, H, W) if fused
+    """
+    # Scale coordinates according to volume size
+    if orig_size:
+        scaled_points = scale_points_3d(points, vol_size, orig_size, offset=offset)
+    else:
+        scaled_points = scale_points_3d(points, vol_size, offset=offset)
+
+    # Generate heatmaps with the scaled points
+    heatmaps = [generate_heatmap_from_points_3d(point, vol_size, sigma) for point in scaled_points]
+
+    if fuse:
+        heatmaps = fuse_heatmaps_3d(heatmaps)
+
+    return np.array(heatmaps)
+
+
+def generate_heatmap_from_points_3d(point, vol_size, sigma):
+    """
+    Generate a 3D Gaussian heatmap centered at the given point.
+    Args:
+        point: 3D point (x, y, z)
+        vol_size: Volume size (D, H, W)
+        sigma: Standard deviation for Gaussian
+    Returns:
+        Binary 3D heatmap array
+    """
+    # Create a meshgrid of x, y, z coordinates for the volume size
+    x, y, z = np.meshgrid(np.arange(vol_size[0]), np.arange(vol_size[1]), np.arange(vol_size[2]), indexing='ij')
+    # Calculate the heatmap using a 3D Gaussian function centered at the input point
+    heatmap = np.exp(-((x - point[0]) ** 2 + (y - point[1]) ** 2 + (z - point[2]) ** 2) / (2 * sigma ** 2))
+    # Threshold the heatmap so that values below a certain threshold are set to 0
+    binary_heatmap = np.where(heatmap < 0.5*heatmap.max(), 0, 1)
+
+    assert is_binary_image(binary_heatmap), "Image is not binary"
+
+    return binary_heatmap
+
+## -----------------------------------------------------------------------------------------------------------------##
+##                                   3D LANDMARKS EXTRACTION FROM HEATMAPS                                          ##
+## -----------------------------------------------------------------------------------------------------------------##
+
+def extract_landmarks_3d(heatmaps, num_landmarks):
+    """
+    Extract 3D landmark coordinates from heatmaps.
+    Args:
+        heatmaps: 3D heatmaps tensor, shape (N, D, H, W)
+        num_landmarks: Number of landmarks to extract
+    Returns:
+        Array of normalized landmark coordinates, shape (N, 3)
+    """
+    landmarks = np.zeros((num_landmarks, 3), dtype=np.float64)
+    heatmap_depth, heatmap_height, heatmap_width = heatmaps.shape[1], heatmaps.shape[2], heatmaps.shape[3]
+
+    # Loop all the heatmaps (one for each landmark)
+    for i in range(num_landmarks):
+        heatmap_channel = heatmaps[i]  # get the heatmap number i
+        
+        # binarize the heatmap channel using a threshold
+        binary_vol = np.where(heatmap_channel < 0.5 * heatmap_channel.max(), 0, 1)
+        binary_vol = binary_vol.astype(np.uint8)  # convert the binary volume to uint8 datatype
+
+        assert is_binary_image(binary_vol), "Volume is not binary"
+
+        # For 3D, we find the center of mass
+        # Get indices of all non-zero voxels
+        nonzero_indices = np.argwhere(binary_vol > 0)
+        
+        if len(nonzero_indices) > 0:
+            # Calculate centroid as mean of all non-zero voxel coordinates
+            centroid_z = np.mean(nonzero_indices[:, 0])
+            centroid_y = np.mean(nonzero_indices[:, 1])
+            centroid_x = np.mean(nonzero_indices[:, 2])
+            
+            # Normalize the coordinates
+            landmarks[i, :] = [
+                centroid_z / heatmap_depth,
+                centroid_y / heatmap_height,
+                centroid_x / heatmap_width
+            ]
+
+    return landmarks
