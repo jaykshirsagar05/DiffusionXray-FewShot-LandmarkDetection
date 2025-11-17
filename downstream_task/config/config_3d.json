@@ -1,0 +1,48 @@
+{
+    "gpu": 0,
+    "experiment_path": "downstream_task/landmarks_experiments_3d",
+    "is_3d": true,
+    "model": {
+        "name": "ddpm",
+        "encoder": "",
+        "lr": 1e-5,
+        "optimizer": "AdamW",
+        "scheduler": "ReduceLROnPlateau",
+        "loss_function": "CrossEntropyLoss",
+        "epochs": 200
+    },
+
+    "training_protocol":{
+        "apply": true,
+
+        "scratch": {
+            "apply": true,
+            "resume": false
+        },
+
+        "finetuning": {
+            "apply": false,
+            "resume": false,
+            "path": "",
+            "different_dataset": false
+        }
+    },
+
+    "inference_protocol": {
+        "apply": true,
+        "use_validation_set_for_inference": false
+    },
+
+    "dataset":{
+        "name": "volume3d",
+        "path": "datasets/",
+        "image_size": [64, 64, 64],
+        "image_channels": 1,
+        "sigma": 2,
+        "batch_size": 1,
+        "grad_accumulation": 16,
+        "num_workers": 2,
+        "pin_memory": true,
+        "training_samples": "all"
+    }
+}
