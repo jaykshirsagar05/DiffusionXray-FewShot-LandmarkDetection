@@ -87,6 +87,7 @@ if __name__ == "__main__":
     TRAINING_SAMPLES = config["dataset"]["training_samples"]
     PIN_MEMORY = config["dataset"]["pin_memory"]
     NUM_WORKERS = 2 if config["dataset"]["num_workers"] == None else config["dataset"]["num_workers"]
+    IS_3D = config.get("is_3d", False)
     
     # Model parameters
     MODEL_NAME = config["model"]["name"]
@@ -131,6 +132,10 @@ if __name__ == "__main__":
         train_dataset = Cephalo(prefix=DATASET_PATH, phase='train', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
         val_dataset = Cephalo(prefix=DATASET_PATH, phase='validate', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
         test_dataset = Cephalo(prefix=DATASET_PATH, phase='test', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
+    elif DATASET_NAME == "volume3d":
+        train_dataset = Volume3D(prefix=DATASET_PATH, phase='train', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
+        val_dataset = Volume3D(prefix=DATASET_PATH, phase='validate', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
+        test_dataset = Volume3D(prefix=DATASET_PATH, phase='test', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
     else:
         raise Exception("Dataset not found")
 
@@ -210,7 +215,8 @@ if __name__ == "__main__":
             self_condition=True,
             resnet_block_groups=4,
             att_heads=4,
-            att_res=32
+            att_res=32,
+            is_3d=IS_3D
         ).to(device)
             
         if PRETRAINED == True and config["training_protocol"]["finetuning"]["resume"] == False:

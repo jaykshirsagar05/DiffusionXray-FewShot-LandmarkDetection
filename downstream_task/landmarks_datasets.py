@@ -10,6 +10,8 @@ from skimage.transform import resize
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
+import nibabel as nib  # For 3D medical imaging (NIfTI format)
+import SimpleITK as sitk  # For reading .mhd/.raw files
 ## -----------------------------------------------------------------------------------------------------------------##
 ##                                                          CHEST DATASET                                           ##
 ## -----------------------------------------------------------------------------------------------------------------##
@@ -391,3 +393,165 @@ class Cephalo(torch.utils.data.Dataset):
             raise ValueError('phase must be either "train" or "validate" or "test"')
 
 
+
+## -----------------------------------------------------------------------------------------------------------------##
+##                                                          3D VOLUME DATASET                                       ##
+## -----------------------------------------------------------------------------------------------------------------##
+
+"""
+Generic 3D volume dataset for landmark detection.
+Supports NIfTI (.nii, .nii.gz) and NumPy (.npy) formats.
+"""
+
+class Volume3D(torch.utils.data.Dataset):
+
+    def __init__(self, prefix, phase, size=(64, 64, 64), num_channels=1, fuse_heatmap=False, sigma=2, file_extension='.nii.gz'):
+        self.phase = phase
+        self.new_size = size
+        self.dataset_name = 'Volume3D'
+        self.num_channels = num_channels
+        self.fuse_heatmap = fuse_heatmap
+        self.sigma = sigma
+        self.file_extension = file_extension
+        
+        # Expected directory structure: prefix/volumes/ and prefix/landmarks/
+        self.pth_Volume = os.path.join(prefix, 'volumes')
+        self.pth_Label = os.path.join(prefix, 'landmarks')
+        
+        # file index
+        files = [i.replace(file_extension, '') for i in sorted(os.listdir(self.pth_Volume)) if i.endswith(file_extension)]
+        
+        # Split into train/validate/test (80/10/10 split by default)
+        n = len(files)
+        train_num = int(n * 0.8)
+        val_num = int(n * 0.1)
+        test_num = n - train_num - val_num
+        
+        if self.phase == 'train':
+            self.indexes = files[:train_num]
+        elif self.phase == 'validate':
+            self.indexes = files[train_num:train_num+val_num]
+        elif self.phase == 'test':
+            self.indexes = files[train_num+val_num:]
+        elif self.phase == 'all':
+            self.indexes = files
+        else:
+            raise Exception(f"Unknown phase: {phase}")
+        
+        # Determine number of landmarks from first file
+        if len(self.indexes) > 0:
+            first_landmark_file = os.path.join(self.pth_Label, self.indexes[0] + '.txt')
+            if os.path.exists(first_landmark_file):
+                with open(first_landmark_file, 'r') as f:
+                    self.num_landmarks = int(f.readline().strip())
+            else:
+                # Default to a reasonable number if no label file exists
+                self.num_landmarks = 10
+        else:
+            self.num_landmarks = 10
+
+    def __getitem__(self, index):
+        name = self.indexes[index]
+        ret = {'name': name}
+
+        vol, vol_size = self.readVolume(os.path.join(self.pth_Volume, name + self.file_extension))
+        points = self.readLandmark(name)
+        
+        # Generate 3D heatmaps from landmarks
+        heatmaps = utilities.points_to_heatmap_3d(points, sigma=self.sigma, vol_size=self.new_size, fuse=self.fuse_heatmap)
+        
+        # Volume is already a torch tensor [C, D, H, W]
+        ret['image'] = vol
+        ret['landmarks'] = torch.FloatTensor(points)
+        # Convert heatmaps to torch tensor [C, D, H, W]. Stack to give new dimension and float32 type
+        if self.fuse_heatmap:
+            ret['heatmaps'] = torch.from_numpy(heatmaps).float().unsqueeze(0)
+        else:
+            ret['heatmaps'] = torch.from_numpy(heatmaps).float()
+        ret['original_size'] = torch.FloatTensor(vol_size)
+        ret['resized_size'] = torch.FloatTensor(self.new_size)
+
+        return ret
+
+    def __len__(self):
+        return len(self.indexes)
+
+    def readLandmark(self, name):
+        """
+        Read landmark points from text file.
+        Format: First line contains number of landmarks, 
+        subsequent lines contain normalized coordinates (x, y, z in range [0, 1])
+        """
+        path = os.path.join(self.pth_Label, name + '.txt')
+        points = []
+        with open(path, 'r') as f:
+            n = int(f.readline())
+            for i in range(n):
+                coords = [float(i) for i in f.readline().split()]
+                points.append(coords)
+        return np.array(points)
+    
+    def readVolume(self, path):
+        """
+        Read 3D volume from file and process it.
+        Supports NIfTI (.nii, .nii.gz) and NumPy (.npy) formats.
+        """
+        if path.endswith('.npy'):
+            # Load NumPy array
+            volume_np = np.load(path).astype(np.float32)
+        elif path.endswith('.nii') or path.endswith('.nii.gz'):
+            # Load NIfTI file
+            nii_img = nib.load(path)
+            volume_np = nii_img.get_fdata().astype(np.float32)
+        elif path.endswith('.mhd'):
+            # Load MetaImage file
+            sitk_image = sitk.ReadImage(path)
+            volume_np = sitk.GetArrayFromImage(sitk_image).astype(np.float32)
+        else:
+            raise ValueError(f'Unsupported file format: {path}')
+        
+        # Store original size
+        origin_size = volume_np.shape
+        
+        # Ensure volume is 3D
+        if volume_np.ndim == 3:
+            # Add channel dimension: (D, H, W) -> (C, D, H, W)
+            volume_np = np.expand_dims(volume_np, axis=0)
+        elif volume_np.ndim == 4:
+            # Assume format is (D, H, W, C) -> transpose to (C, D, H, W)
+            volume_np = np.transpose(volume_np, (3, 0, 1, 2))
+        else:
+            raise ValueError(f'Expected 3D or 4D volume, got shape: {volume_np.shape}')
+        
+        # Handle channels
+        if self.num_channels == 1:
+            if volume_np.shape[0] > 1:
+                # Take first channel or average
+                volume_np = volume_np[0:1, :, :, :]
+        elif self.num_channels == 3:
+            if volume_np.shape[0] == 1:
+                # Repeat channel 3 times
+                volume_np = np.repeat(volume_np, 3, axis=0)
+        
+        # Resize volume to target size
+        # volume_np shape: (C, D, H, W)
+        resized_volume = np.zeros((self.num_channels, self.new_size[0], self.new_size[1], self.new_size[2]), dtype=np.float32)
+        for c in range(self.num_channels):
+            resized_volume[c] = resize(
+                volume_np[c], 
+                (self.new_size[0], self.new_size[1], self.new_size[2]),
+                mode='constant',
+                anti_aliasing=True,
+                preserve_range=True
+            )
+        
+        # Normalize to [0, 1]
+        min_val = resized_volume.min()
+        max_val = resized_volume.max()
+        if max_val > min_val:
+            resized_volume = (resized_volume - min_val) / (max_val - min_val)
+        
+        # Convert to torch tensor
+        volume_tensor = torch.from_numpy(resized_volume).float()
+        
+        return volume_tensor, origin_size
