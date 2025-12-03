@@ -493,65 +493,357 @@ class Volume3D(torch.utils.data.Dataset):
     
     def readVolume(self, path):
         """
-        Read 3D volume from file and process it.
-        Supports NIfTI (.nii, .nii.gz) and NumPy (.npy) formats.
-        """
-        if path.endswith('.npy'):
-            # Load NumPy array
-            volume_np = np.load(path).astype(np.float32)
-        elif path.endswith('.nii') or path.endswith('.nii.gz'):
-            # Load NIfTI file
-            nii_img = nib.load(path)
-            volume_np = nii_img.get_fdata().astype(np.float32)
-        elif path.endswith('.mhd'):
-            # Load MetaImage file
-            sitk_image = sitk.ReadImage(path)
-            volume_np = sitk.GetArrayFromImage(sitk_image).astype(np.float32)
-        else:
-            raise ValueError(f'Unsupported file format: {path}')
+        Read 3D CT volume from MetaImage (.mhd) file using GPU-accelerated MONAI transforms.
         
-        # Store original size
+        Returns:
+            volume_tensor: Processed volume as torch tensor [C, D, H, W]
+            origin_size: Original volume dimensions
+            origin: World coordinate origin
+            spacing: Voxel spacing in mm
+        """
+        # Read MetaImage file using SimpleITK
+        sitk_image = sitk.ReadImage(path)
+        
+        # Get metadata
+        origin = sitk_image.GetOrigin()      # World coordinate origin
+        spacing = sitk_image.GetSpacing()    # Voxel spacing in mm
+        
+        # Get volume as numpy array
+        # SimpleITK returns (z, y, x) ordering which is (D, H, W)
+        volume_np = sitk.GetArrayFromImage(sitk_image).astype(np.float32)
+        
+        # Store original size (D, H, W)
         origin_size = volume_np.shape
         
-        # Ensure volume is 3D
-        if volume_np.ndim == 3:
-            # Add channel dimension: (D, H, W) -> (C, D, H, W)
-            volume_np = np.expand_dims(volume_np, axis=0)
-        elif volume_np.ndim == 4:
-            # Assume format is (D, H, W, C) -> transpose to (C, D, H, W)
-            volume_np = np.transpose(volume_np, (3, 0, 1, 2))
+        # Apply MONAI transforms (GPU-accelerated)
+        # MONAI expects (D, H, W) or (C, D, H, W)
+        volume_tensor = self.monai_transforms(volume_np)
+        
+        # Ensure correct number of channels
+        if volume_tensor.shape[0] != self.num_channels:
+            if self.num_channels == 1 and volume_tensor.shape[0] > 1:
+                volume_tensor = volume_tensor[0:1]
+            elif self.num_channels == 3 and volume_tensor.shape[0] == 1:
+                volume_tensor = volume_tensor.repeat(3, 1, 1, 1)
+        
+        return volume_tensor, origin_size, origin, spacing
+
+    def apply_ct_window(self, volume, window_center=-600, window_width=1500):
+        """
+        Apply CT windowing to enhance relevant structures.
+        
+        Args:
+            volume: Raw CT volume in Hounsfield Units
+            window_center: Window center (default -600 for lung)
+            window_width: Window width (default 1500 for lung)
+        
+        Returns:
+            Windowed volume normalized to [0, 1]
+        """
+        min_val = window_center - window_width // 2
+        max_val = window_center + window_width // 2
+        
+        volume = np.clip(volume, min_val, max_val)
+        volume = (volume - min_val) / (max_val - min_val)
+        
+        return volume
+
+class LUNA16(torch.utils.data.Dataset):
+
+    def __init__(self, prefix, phase, size=(64, 64, 64), num_channels=1, fuse_heatmap=False, sigma=2, 
+                 subsets=None, max_landmarks=None):
+        """
+        Initialize LUNA16 dataset for landmark detection.
+        
+        Args:
+            prefix: Path to LUNA16 dataset root directory
+            phase: 'train', 'validate', 'test', or 'all'
+            size: Target volume size (D, H, W)
+            num_channels: Number of input channels (typically 1 for CT)
+            fuse_heatmap: Whether to fuse all heatmaps into one
+            sigma: Standard deviation for 3D Gaussian heatmaps
+            subsets: List of subset indices to use (e.g., [0,1,2,3,4,5,6] for train)
+                    If None, uses default 10-fold cross-validation split
+            max_landmarks: Maximum number of landmarks per scan (pads/truncates if set)
+        """
+        self.phase = phase
+        self.new_size = size
+        self.dataset_name = 'LUNA16'
+        self.num_channels = num_channels
+        self.fuse_heatmap = fuse_heatmap
+        self.sigma = sigma
+        self.prefix = prefix
+        self.max_landmarks = max_landmarks
+        
+        # Import MONAI transforms for GPU acceleration
+        from monai.transforms import (
+            Compose, 
+            Resize, 
+            ScaleIntensityRange,
+            EnsureChannelFirst,
+            ToTensor
+        )
+        
+        # Create MONAI transform pipeline
+        self.monai_transforms = Compose([
+            EnsureChannelFirst(channel_dim='no_channel'),  # Adds channel dim if needed
+            ScaleIntensityRange(
+                a_min=-1000.0,  # HU min for lung
+                a_max=400.0,    # HU max for lung
+                b_min=0.0,
+                b_max=1.0,
+                clip=True
+            ),
+            Resize(
+                spatial_size=(size[0], size[1], size[2]),
+                mode='trilinear',  # Better quality than nearest
+                align_corners=True
+            ),
+            ToTensor()
+        ])
+        print("LUNA16 Landmark Dataset: Using GPU-accelerated MONAI transforms")
+        
+        # Load annotations
+        self.annotations_df = pd.read_csv(os.path.join(prefix, 'annotations.csv'))
+        
+        # Group annotations by SeriesInstanceUID
+        self.annotations_grouped = self.annotations_df.groupby('seriesuid')
+        
+        # Determine which subsets to use based on phase
+        if subsets is not None:
+            self.subsets = subsets
         else:
-            raise ValueError(f'Expected 3D or 4D volume, got shape: {volume_np.shape}')
+            if phase == 'train':
+                self.subsets = [5,6,7]
+            elif phase == 'validate':
+                self.subsets = [8]
+            elif phase == 'test':
+                self.subsets = [9]
+            elif phase == 'all':
+                self.subsets = [0,1,2,3,4,5,6,7,8,9]
+            else:
+                raise Exception(f"Unknown phase: {phase}")
         
-        # Handle channels
-        if self.num_channels == 1:
-            if volume_np.shape[0] > 1:
-                # Take first channel or average
-                volume_np = volume_np[0:1, :, :, :]
-        elif self.num_channels == 3:
-            if volume_np.shape[0] == 1:
-                # Repeat channel 3 times
-                volume_np = np.repeat(volume_np, 3, axis=0)
+        # Build list of available scans
+        self.scan_paths = {}  # uid -> path to .mhd file
+        self.indexes = []
+        total_scans_found = 0
+        skipped_no_landmarks = 0
         
-        # Resize volume to target size
-        # volume_np shape: (C, D, H, W)
-        resized_volume = np.zeros((self.num_channels, self.new_size[0], self.new_size[1], self.new_size[2]), dtype=np.float32)
-        for c in range(self.num_channels):
-            resized_volume[c] = resize(
-                volume_np[c], 
-                (self.new_size[0], self.new_size[1], self.new_size[2]),
-                mode='constant',
-                anti_aliasing=True,
-                preserve_range=True
+        for subset_idx in self.subsets:
+            # Try both directory structures (some LUNA16 downloads have different structures)
+            subset_dir_options = [
+                os.path.join(prefix, f'subset{subset_idx}', f'subset{subset_idx}'),  # Nested structure
+                os.path.join(prefix, f'subset{subset_idx}'),  # Flat structure
+            ]
+            
+            subset_dir = None
+            for option in subset_dir_options:
+                if os.path.exists(option):
+                    subset_dir = option
+                    break
+            
+            if subset_dir is None:
+                print(f"Warning: subset{subset_idx} not found in {prefix}")
+                continue
+            
+            for filename in os.listdir(subset_dir):
+                if filename.endswith('.mhd'):
+                    uid = filename.replace('.mhd', '')
+                    total_scans_found += 1
+                    
+                    # Only include scans that have annotations with at least 1 landmark
+                    if uid in self.annotations_grouped.groups:
+                        num_annotations = len(self.annotations_grouped.get_group(uid))
+                        if num_annotations > 0:
+                            self.scan_paths[uid] = os.path.join(subset_dir, filename)
+                            self.indexes.append(uid)
+                        else:
+                            skipped_no_landmarks += 1
+                    else:
+                        skipped_no_landmarks += 1
+        
+        # Sort for reproducibility
+        self.indexes = sorted(self.indexes)
+        
+        # Determine number of landmarks (max nodules per scan or fixed)
+        if self.max_landmarks is None:
+            # Find the maximum number of nodules in any scan
+            self.num_landmarks = self.annotations_grouped.size().max()
+        else:
+            self.num_landmarks = self.max_landmarks
+        
+        print(f"LUNA16 {phase} dataset: {len(self.indexes)} scans with landmarks, max {self.num_landmarks} landmarks per scan")
+        print(f"Total scans found: {total_scans_found}, Skipped (0 landmarks): {skipped_no_landmarks}")
+        
+        # Add volume cache to speed up data loading
+        self.volume_cache = {}
+        self.use_cache = True  # Set to False if memory is an issue
+
+    def __getitem__(self, index):
+        uid = self.indexes[index]
+        ret = {'name': uid}
+
+        # Read CT volume (with caching)
+        if self.use_cache and uid in self.volume_cache:
+            vol, vol_size, origin, spacing = self.volume_cache[uid]
+        else:
+            vol, vol_size, origin, spacing = self.readVolume(self.scan_paths[uid])
+            if self.use_cache:
+                self.volume_cache[uid] = (vol, vol_size, origin, spacing)
+        
+        # Read landmarks (nodule positions) - normalized [0,1]
+        points_normalized, num_valid_landmarks = self.readLandmarks(uid, vol_size, origin, spacing)
+        
+        # Only use valid landmarks for heatmap generation (exclude padding)
+        valid_points_normalized = points_normalized[:num_valid_landmarks]
+        
+        # Scale normalized points to NEW resized volume coordinates
+        points_resized = valid_points_normalized * np.array(self.new_size)
+        
+        # Generate 3D heatmaps using resized coordinates - ONLY for valid landmarks
+        if num_valid_landmarks > 0:
+            heatmaps = utilities.points_to_heatmap_3d(
+                points_resized,  # Only valid points, already scaled
+                sigma=self.sigma, 
+                vol_size=self.new_size,
+                fuse=self.fuse_heatmap
             )
+        else:
+            # No valid landmarks - create empty heatmaps
+            if self.fuse_heatmap:
+                heatmaps = np.zeros(self.new_size, dtype=np.float32)
+            else:
+                heatmaps = np.zeros((self.num_landmarks, *self.new_size), dtype=np.float32)
         
-        # Normalize to [0, 1]
-        min_val = resized_volume.min()
-        max_val = resized_volume.max()
-        if max_val > min_val:
-            resized_volume = (resized_volume - min_val) / (max_val - min_val)
+        # Pad heatmaps to fixed number if not fused and we have fewer valid landmarks
+        if not self.fuse_heatmap and num_valid_landmarks < self.num_landmarks:
+            padding_shape = (self.num_landmarks - num_valid_landmarks, *self.new_size)
+            padding = np.zeros(padding_shape, dtype=np.float32)
+            heatmaps = np.concatenate([heatmaps, padding], axis=0)
         
-        # Convert to torch tensor
-        volume_tensor = torch.from_numpy(resized_volume).float()
+        # Volume is already a torch tensor [C, D, H, W]
+        ret['image'] = vol
+        ret['landmarks'] = torch.FloatTensor(points_normalized)  # Full array with padding
+        ret['num_valid_landmarks'] = num_valid_landmarks
         
-        return volume_tensor, origin_size
+        # Convert heatmaps to torch tensor
+        if self.fuse_heatmap:
+            ret['heatmaps'] = torch.from_numpy(heatmaps).float().unsqueeze(0)
+        else:
+            ret['heatmaps'] = torch.from_numpy(heatmaps).float()
+        
+        ret['original_size'] = torch.FloatTensor(vol_size)
+        ret['resized_size'] = torch.FloatTensor(self.new_size)
+        ret['origin'] = torch.FloatTensor(origin)
+        ret['spacing'] = torch.FloatTensor(spacing)
+
+        return ret
+
+    def __len__(self):
+        return len(self.indexes)
+
+    def world_to_voxel(self, world_coord, origin, spacing):
+        """
+        Convert world coordinates to voxel coordinates.
+        
+        Args:
+            world_coord: (x, y, z) in world space (mm)
+            origin: Volume origin in world space
+            spacing: Voxel spacing in mm
+        
+        Returns:
+            Voxel coordinates (z, y, x) - note the order change for numpy indexing
+        """
+        # LUNA16 uses (x, y, z) world coordinates
+        # Convert to voxel indices
+        voxel_coord = (np.array(world_coord) - np.array(origin)) / np.array(spacing)
+        # Return in (z, y, x) order for numpy array indexing
+        return [voxel_coord[2], voxel_coord[1], voxel_coord[0]]
+
+    def readLandmarks(self, uid, vol_size, origin, spacing):
+        """
+        Read nodule annotations for a given scan and convert to normalized coordinates.
+        
+        Args:
+            uid: SeriesInstanceUID of the scan
+            vol_size: Original volume size (D, H, W)
+            origin: Volume origin in world coordinates
+            spacing: Voxel spacing
+        
+        Returns:
+            points: Array of normalized landmark coordinates (N, 3) in (z, y, x) order
+            num_valid: Number of valid (non-padded) landmarks
+        """
+        # Get annotations for this scan
+        scan_annotations = self.annotations_grouped.get_group(uid)
+        
+        points = []
+        for _, row in scan_annotations.iterrows():
+            # World coordinates from annotation
+            world_coord = [row['coordX'], row['coordY'], row['coordZ']]
+            
+            # Convert to voxel coordinates (z, y, x)
+            voxel_coord = self.world_to_voxel(world_coord, origin, spacing)
+            
+            # Normalize to [0, 1] range
+            normalized_coord = [
+                voxel_coord[0] / vol_size[0],  # z / D
+                voxel_coord[1] / vol_size[1],  # y / H
+                voxel_coord[2] / vol_size[2],  # x / W
+            ]
+            
+            # Clip to valid range
+            normalized_coord = [max(0, min(1, c)) for c in normalized_coord]
+            points.append(normalized_coord)
+        
+        num_valid = len(points)
+        
+        # Pad or truncate to fixed number of landmarks
+        if len(points) < self.num_landmarks:
+            # Pad with -1 (invalid marker) instead of [0,0,0]
+            while len(points) < self.num_landmarks:
+                points.append([-1.0, -1.0, -1.0])  # Invalid marker - won't create corner heatmaps
+        elif len(points) > self.num_landmarks:
+            # Truncate
+            points = points[:self.num_landmarks]
+            num_valid = self.num_landmarks
+        
+        return np.array(points), num_valid
+
+    def readVolume(self, path):
+        """
+        Read 3D CT volume from MetaImage (.mhd) file using GPU-accelerated MONAI transforms.
+        
+        Returns:
+            volume_tensor: Processed volume as torch tensor [C, D, H, W]
+            origin_size: Original volume dimensions
+            origin: World coordinate origin
+            spacing: Voxel spacing in mm
+        """
+        # Read MetaImage file using SimpleITK
+        sitk_image = sitk.ReadImage(path)
+        
+        # Get metadata
+        origin = sitk_image.GetOrigin()      # World coordinate origin
+        spacing = sitk_image.GetSpacing()    # Voxel spacing in mm
+        
+        # Get volume as numpy array
+        # SimpleITK returns (z, y, x) ordering which is (D, H, W)
+        volume_np = sitk.GetArrayFromImage(sitk_image).astype(np.float32)
+        
+        # Store original size (D, H, W)
+        origin_size = volume_np.shape
+        
+        # Apply MONAI transforms (GPU-accelerated)
+        # MONAI expects (D, H, W) or (C, D, H, W)
+        volume_tensor = self.monai_transforms(volume_np)
+        
+        # Ensure correct number of channels
+        if volume_tensor.shape[0] != self.num_channels:
+            if self.num_channels == 1 and volume_tensor.shape[0] > 1:
+                volume_tensor = volume_tensor[0:1]
+            elif self.num_channels == 3 and volume_tensor.shape[0] == 1:
+                volume_tensor = volume_tensor.repeat(3, 1, 1, 1)
+        
+        return volume_tensor, origin_size, origin, spacing

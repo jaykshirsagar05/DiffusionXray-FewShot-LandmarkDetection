@@ -369,7 +369,10 @@ class LUNA16DiffusionDataset(Dataset):
         # Collect all .mhd files from subsets
         all_files = []
         for subset_id in range(10):  # subset0 to subset9
-            subset_dir = os.path.join(root_dir, f'subset{subset_id}', f'subset{subset_id}')
+            if subset_id != 9:
+                subset_dir = os.path.join(root_dir, f'subset{subset_id}', f'subset{subset_id}')
+            else:
+                subset_dir = os.path.join(root_dir, f'subset{subset_id}')
             if os.path.exists(subset_dir):
                 mhd_files = [f for f in os.listdir(subset_dir) if f.endswith('.mhd')]
                 for mhd_file in mhd_files:
@@ -387,9 +390,8 @@ class LUNA16DiffusionDataset(Dataset):
             # Use specific subsets
             self.volume_files = [f for f in all_files if f['subset'] in subset_ids]
         else:
-            # Default 10-fold split: use first 8 subsets for train, last 2 for test
-            train_subsets = list(range(8))  # subsets 0-7 for training
-            test_subsets = list(range(8, 10))  # subsets 8-9 for testing
+            train_subsets = [0,1,3,4]
+            test_subsets = [9]
             
             if phase == 'train':
                 self.volume_files = [f for f in all_files if f['subset'] in train_subsets]

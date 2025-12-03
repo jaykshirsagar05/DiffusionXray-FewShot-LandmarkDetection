@@ -1,4 +1,3 @@
-
 import numpy as np
 import scipy.spatial.distance as dist
 import utilities
@@ -25,39 +24,54 @@ def compute_mse(gt_keypoints, pred_keypoints):
 ##                                                  mAp with OKS for heatmaps                                       ##
 ## -----------------------------------------------------------------------------------------------------------------##
 def compute_oks_heatmaps(ground_truth, prediction, sigma):
-    distance = dist.cdist(ground_truth, prediction, 'euclidean')
-    scale = 1 
+    """
+    Compute OKS between two (possibly multi‑dimensional) heatmaps by flattening them.
+    ground_truth, prediction: arrays with the same shape, e.g. (H, W) or (D, H, W).
+    """
+    gt_flat = ground_truth.reshape(1, -1)   # (1, N)
+    pred_flat = prediction.reshape(1, -1)   # (1, N)
+    distance = dist.cdist(gt_flat, pred_flat, 'euclidean')  # (1, 1)
+    scale = 1
     oks = np.exp(-1 * (distance ** 2) / (2 * (sigma**2) * (scale ** 2)))
     return oks
 
 def compute_map_heatmaps(ground_truth_heatmaps, predicted_heatmaps, sigma=0.1, thresholds=np.arange(0.5, 1.0, 0.05)):
+    """
+    Compute a toy mAP-like score between two heatmaps (2D or 3D) by:
+      1) computing a single OKS value between flattened maps
+      2) thresholding that scalar at multiple levels.
+    This keeps the interface but avoids shape errors.
+    """
     aps = []
 
     assert ground_truth_heatmaps.shape == predicted_heatmaps.shape, "Heatmaps should have the same shape"
 
-    oks = compute_oks_heatmaps(ground_truth_heatmaps, predicted_heatmaps, sigma)
-    for threshold in thresholds:
-        tp = np.sum(oks >= threshold)
-        fp = np.sum(oks < threshold)
-        precision = tp / (tp + fp)
-        aps.append(precision)
-    map_value = np.mean(aps)
+    oks = compute_oks_heatmaps(ground_truth_heatmaps, predicted_heatmaps, sigma)  # shape (1,1)
+    oks_scalar = float(oks[0, 0])
 
+    for threshold in thresholds:
+        tp = 1 if oks_scalar >= threshold else 0
+        fp = 1 - tp
+        precision = tp / (tp + fp)  # either 1 or 0
+        aps.append(precision)
+
+    map_value = np.mean(aps)
     return map_value
 
 
 ## -----------------------------------------------------------------------------------------------------------------##
 ##                                                  mAp with OKS for keypoints                                       ##
 ## -----------------------------------------------------------------------------------------------------------------##
-def compute_oks_keypoints(ground_truth, prediction, sigma):
-    # Calculate the distance between the ground truth and prediction points
-    distance = np.sqrt(np.sum((ground_truth - prediction)**2, axis=1))
-
-    # Calculate the scale, assuming the points are normalized
-    #scale = np.max(ground_truth) - np.min(ground_truth)
+def compute_oks_keypoints(ground_truth, prediction, sigma, axis_scale=None):
+    """
+    axis_scale: per-axis physical scaling (e.g. voxel spacing). If provided, distance computed after scaling.
+    """
+    diff = ground_truth - prediction
+    if axis_scale is not None:
+        diff = diff * axis_scale  # broadcast (N,3) * (3,)
+    distance = np.sqrt(np.sum(diff**2, axis=1))
     scale = 1
-    # Calculate the OKS value
-    oks = np.exp(-1 * (distance ** 2) / (2 * (sigma**2) * (scale ** 2)))
+    oks = np.exp(- (distance ** 2) / (2 * (sigma ** 2) * (scale ** 2)))
     return oks
 
 
@@ -144,7 +158,7 @@ This measures the percentage of predicted landmarks that are within a threshold 
 It is calculated by get_sdr which counts the number of distances below each threshold and divides by the total number of landmarks.
 """
 
-def compute_sdr(distance_list, threshold=[2, 2.5, 3, 4, 6, 9, 10]):
+def compute_sdr(distance_list, threshold=[10, 15, 20, 25, 30]):
     """
     Compute Successful Detection Rate (SDR) in pixel for a given list of distances and thresholds.
     The SDR is the proportion of predicted points that fall within a certain distance threshold from the ground truth points.
@@ -161,74 +175,95 @@ def compute_sdr(distance_list, threshold=[2, 2.5, 3, 4, 6, 9, 10]):
 ## -----------------------------------------------------------------------------------------------------------------##
 
 
-def compute_batch_metrics(gt_batch_keypoints, gt_batch_heatmaps, pred_batch, image_size, num_landmarks, useHeatmaps, sigma):
+def compute_batch_metrics(gt_batch_keypoints, gt_batch_heatmaps, pred_batch, image_size, num_landmarks, useHeatmaps, sigma, spacing_batch=None, fused=False, num_valid_batch=None):
+    """
+    Compute batch metrics for 2D/3D.
+    
+    Args:
+        num_valid_batch: torch.Tensor [B] containing number of valid landmarks per sample
+                        (required for datasets with variable landmark counts like LUNA16)
+    """
+    # Ensure numpy
+    if hasattr(pred_batch, "detach"):
+        pred_batch = pred_batch.detach().numpy()
 
     batch_size = pred_batch.shape[0]
-    mse_list = []
-    map_list1 = []
-    map_list2 = []
-    iou_list = []
-    distance_list = []  
+    mse_list, map_list1, map_list2, iou_list, distance_list = [], [], [], [], []
 
-    #sigma = sigma/10
-    sigma = 5
-        
-    # Loop through the batch
     for i in range(batch_size):
-        single_gt_keypoints = gt_batch_keypoints[i, :, :].numpy()
-        single_gt_heatmaps = gt_batch_heatmaps[i, :, :].numpy()
-        single_prediction = pred_batch[i, :, :].numpy()
-        single_image_size = tuple(image_size[i].int().tolist())            
-
-        # So when i compare predicted extracted keypoints with original keypoints they all have the same system reference and same origin size
-        single_gt_keypoints = utilities.extract_landmarks(single_gt_heatmaps, num_landmarks)
-
-        # Fuse the original heatmaps
-        single_gt_heatmaps_fused = utilities.points_to_heatmap(single_gt_keypoints, img_size=single_image_size, sigma=sigma, fuse=True)
-        #single_gt_heatmaps_fused = utilities.fuse_heatmaps(single_gt_heatmaps)
-
-        if useHeatmaps:
-            # Extract landmarks from the model's output
-            single_pred_keypoints = utilities.extract_landmarks(single_prediction, num_landmarks)
-
-            # Upscaling the prediction to the original image size to compute metrics
-            single_pred_heatmaps = utilities.points_to_heatmap(single_pred_keypoints, img_size=single_image_size, sigma=sigma, fuse=True)
-        else:
-            single_pred_keypoints = single_prediction
-            single_pred_heatmaps = utilities.points_to_heatmap(single_pred_keypoints, img_size=single_image_size, sigma=sigma, fuse=True)
-
-        gt_scaled_points = np.array(utilities.scale_points(single_gt_keypoints, single_image_size))
-        pred_scaled_points = np.array(utilities.scale_points(single_pred_keypoints, single_image_size))
-
-        # Compute Distance list for MRE and SDR
-        if num_landmarks == 6:
-            physical_factor = 1 # chest
-        elif num_landmarks == 19:
-            physical_factor = np.array([2400/single_image_size[0], 1935/single_image_size[1]]) * 0.1 # head
-            #physical_factor = 0.46875 # ceph
-            #physical_factor = 0.9375
-        elif num_landmarks == 37:
-            physical_factor = 50/radial(gt_scaled_points[0], gt_scaled_points[4]) # hand
-        else:
-            raise Exception("Error: Unknown number of landmarks")
-
-        cur_distance_list = cal_all_distance(pred_scaled_points, gt_scaled_points, physical_factor)
-        distance_list += cur_distance_list
-
-        # Compute MSE
-        mse = compute_mse(gt_scaled_points, pred_scaled_points)
-        mse_list.append(mse)
-
-        # Compute mAP with keypoints
-        map2 = compute_map_keypoints(gt_scaled_points, pred_scaled_points)
-        map_list2.append(map2)
-
-        # Compute mAP with heatmaps
-        map1 = compute_map_heatmaps(single_gt_heatmaps_fused, single_pred_heatmaps)
-        map_list1.append(map1)
-
-        # Compute IoU
-        iou = compute_iou_heatmaps(single_gt_heatmaps_fused, single_pred_heatmaps)
-        iou_list.append(iou)
+        single_gt_keypoints = gt_batch_keypoints[i].numpy()  # normalized
+        single_gt_heatmaps = gt_batch_heatmaps[i].numpy()
+        single_pred_maps = pred_batch[i]  # numpy
+        grid_size = tuple(image_size[i].int().tolist())
         
+        # Get number of valid landmarks for this sample
+        if num_valid_batch is not None:
+            num_valid = int(num_valid_batch[i].item())
+        else:
+            num_valid = num_landmarks  # Assume all are valid
+
+        is_3d = (single_pred_maps.ndim == 4)  # (C,D,H,W) for 3D
+
+        if is_3d:
+            # Extract predicted keypoints from model heatmaps
+            if useHeatmaps:
+                pred_keypoints_all = utilities.extract_landmarks_3d(single_pred_maps, num_landmarks)
+            else:
+                pred_keypoints_all = single_pred_maps  # coordinate regression path
+
+            # **FIX: Only use valid landmarks for metrics**
+            gt_keypoints = single_gt_keypoints[:num_valid]  # Only valid GT
+            pred_keypoints = pred_keypoints_all[:num_valid]  # Only valid predictions
+
+            # Build fused heatmaps from points on the evaluation grid
+            gt_heat_fused = utilities.points_to_heatmap_3d(gt_keypoints, vol_size=grid_size, sigma=sigma, fuse=True)
+            pred_heat_fused = utilities.points_to_heatmap_3d(pred_keypoints, vol_size=grid_size, sigma=sigma, fuse=True)
+
+            # Scale to voxel indices
+            gt_vox = np.array(utilities.scale_points_3d(gt_keypoints, grid_size))
+            pred_vox = np.array(utilities.scale_points_3d(pred_keypoints, grid_size))
+
+            # If spacing (dz,dy,dx) is provided, convert to mm
+            if spacing_batch is not None:
+                sp = spacing_batch[i].numpy()  # (dz, dy, dx)
+                gt_phys = gt_vox * sp
+                pred_phys = pred_vox * sp
+                use_points_for_dist = (pred_phys, gt_phys)
+            else:
+                use_points_for_dist = (pred_vox, gt_vox)
+
+            # Distances and MSE (voxel or mm consistent)
+            cur_distance_list = cal_all_distance(use_points_for_dist[0], use_points_for_dist[1], factor=1)
+            distance_list += cur_distance_list
+            mse_list.append(compute_mse(use_points_for_dist[1], use_points_for_dist[0]))
+
+            # Keypoint mAP only when per-landmark maps are meaningful
+            if not fused:
+                map_list2.append(compute_map_keypoints(gt_vox, pred_vox))
+            # Heatmap mAP & IoU on fused maps
+            map_list1.append(compute_map_heatmaps(gt_heat_fused, pred_heat_fused))
+            iou_list.append(compute_iou_heatmaps(gt_heat_fused, pred_heat_fused))
+
+        else:
+            # 2D path (unchanged)
+            if useHeatmaps:
+                pred_keypoints = utilities.extract_landmarks(single_pred_maps, num_landmarks)
+            else:
+                pred_keypoints = single_pred_maps
+
+            gt_keypoints_extracted = utilities.extract_landmarks(single_gt_heatmaps, num_landmarks)
+            gt_heat_fused = utilities.points_to_heatmap(gt_keypoints_extracted, img_size=grid_size, sigma=sigma, fuse=True)
+            pred_heat_fused = utilities.points_to_heatmap(pred_keypoints, img_size=grid_size, sigma=sigma, fuse=True)
+
+            gt_pix = np.array(utilities.scale_points(gt_keypoints_extracted, grid_size))
+            pred_pix = np.array(utilities.scale_points(pred_keypoints, grid_size))
+
+            cur_distance_list = cal_all_distance(pred_pix, gt_pix, factor=1)
+            distance_list += cur_distance_list
+
+            mse_list.append(compute_mse(gt_pix, pred_pix))
+            map_list2.append(compute_map_keypoints(gt_pix, pred_pix))
+            map_list1.append(compute_map_heatmaps(gt_heat_fused, pred_heat_fused))
+            iou_list.append(compute_iou_heatmaps(gt_heat_fused, pred_heat_fused))
+
     return mse_list, map_list1, map_list2, iou_list, distance_list

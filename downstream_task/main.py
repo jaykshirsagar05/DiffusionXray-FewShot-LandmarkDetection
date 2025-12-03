@@ -1,5 +1,3 @@
-
-
 # ------------------------------------------------------------------------
 #                               Libraries
 # ------------------------------------------------------------------------
@@ -17,7 +15,7 @@ import json
 import torch
 from torch import nn 
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 
 # Custom libraries
 from utilities import *
@@ -114,7 +112,7 @@ if __name__ == "__main__":
     OPTIMIZER = config["model"]["optimizer"]
     SCHEDULER = config["model"]["scheduler"]
     LOSS_FUNCTION = config["model"]["loss_function"]
-    PATIENCE = GRAD_ACC + 5
+    PATIENCE = 10
     EARLY_STOPPING = PATIENCE * 2 + 1
     print(f"Pretrained: {PRETRAINED} -> the actual learning rate is {LR}")
     
@@ -136,6 +134,14 @@ if __name__ == "__main__":
         train_dataset = Volume3D(prefix=DATASET_PATH, phase='train', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
         val_dataset = Volume3D(prefix=DATASET_PATH, phase='validate', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
         test_dataset = Volume3D(prefix=DATASET_PATH, phase='test', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA)
+    elif DATASET_NAME == "LUNA16":
+        # LUNA16 specific parameters
+        MAX_LANDMARKS = config["dataset"].get("max_landmarks", 10)
+        FUSE_HEATMAP = config["dataset"].get("fuse_heatmap", False)
+        
+        train_dataset = LUNA16(prefix=DATASET_PATH, phase='train', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA, fuse_heatmap=FUSE_HEATMAP, max_landmarks=MAX_LANDMARKS)
+        val_dataset = LUNA16(prefix=DATASET_PATH, phase='validate', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA, fuse_heatmap=FUSE_HEATMAP, max_landmarks=MAX_LANDMARKS)
+        test_dataset = LUNA16(prefix=DATASET_PATH, phase='test', size=SIZE, num_channels=NUM_CHANNELS, sigma=SIGMA, fuse_heatmap=FUSE_HEATMAP, max_landmarks=MAX_LANDMARKS)
     else:
         raise Exception("Dataset not found")
 
@@ -158,6 +164,19 @@ if __name__ == "__main__":
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS, drop_last=False)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,  pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS)
     test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS)
+
+    # Quick test mode: limit val and test sets
+    QUICK_TEST = config.get("quick_test", False)
+    if QUICK_TEST:
+        quick_test_samples = 3
+        if hasattr(val_dataset, 'indexes') and len(val_dataset.indexes) > quick_test_samples:
+            val_dataset.indexes = val_dataset.indexes[:quick_test_samples]
+        if hasattr(test_dataset, 'indexes') and len(test_dataset.indexes) > quick_test_samples:
+            test_dataset.indexes = test_dataset.indexes[:quick_test_samples]
+        # Recreate dataloaders with reduced datasets
+        val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS)
+        test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS)
+        print(f"QUICK TEST MODE: Val: {len(val_dataset)} | Test: {len(test_dataset)}")
 
     # ---------------------------------------------------------------- LOG FILE ---------
     # Print dataset and experiment info in log file
@@ -211,11 +230,11 @@ if __name__ == "__main__":
         model = Unet(
             dim=SIZE[0],
             channels=NUM_CHANNELS,
-            dim_mults=[1,2,4,8],
-            self_condition=True,
+            dim_mults=[1, 2, 4],
+            self_condition=False,
             resnet_block_groups=4,
             att_heads=4,
-            att_res=32,
+            att_res=16,
             is_3d=IS_3D
         ).to(device)
             
@@ -224,19 +243,22 @@ if __name__ == "__main__":
             checkpoint = torch.load(config["training_protocol"]["finetuning"]["path"], map_location=device)
             model.load_state_dict(checkpoint["model_state_dict"])
             pretrained_epoch = checkpoint.get("epoch", "undefined")
-            #print(f"Loaded model weights from {checkpoint['epoch']} epoch with fid {checkpoint['fid']}")
+            # print(f"Loaded model weights from {checkpoint['epoch']} epoch with fid {checkpoint['fid']}")
             del checkpoint
-            """
+
             # freeze downsampling layers
             for name, param in model.named_parameters():
                 if 'downs' in name:
                     param.requires_grad = False
-            """
+
         else:
             model_name = f"{MODEL_NAME}/random"
 
         # change the number of output channels of the final convolutional layer
-        model.final_conv = nn.Conv2d(model.final_conv.in_channels, NUM_LANDMARKS, 1)
+        if IS_3D:
+            model.final_conv = nn.Conv3d(model.final_conv.in_channels, NUM_LANDMARKS, 1)
+        else:
+            model.final_conv = nn.Conv2d(model.final_conv.in_channels, NUM_LANDMARKS, 1)
     
     # ---------------------------------------------------------------- COUNT PARAMS ---------
     table, total_params = count_parameters(model)
@@ -248,8 +270,10 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------- LOSS FUNCTION ---------
     if LOSS_FUNCTION == "CrossEntropyLoss":
         loss_fn = nn.CrossEntropyLoss()
+    elif LOSS_FUNCTION == "MSELoss":
+        loss_fn = nn.MSELoss()
     else:
-        raise Exception("Loss function not found... Choose between: CrossEntropyLoss")
+        raise Exception("Loss function not found... Choose between: CrossEntropyLoss, MSELoss")
 
     # ---------------------------------------------------------------- OPTIMIZER ---------  
     if OPTIMIZER == "Adam":
@@ -261,7 +285,10 @@ if __name__ == "__main__":
         
     # ---------------------------------------------------------------- SCHEDULER ---------
     if SCHEDULER == "ReduceLROnPlateau":
-        scheduler = ReduceLROnPlateau(optimizer, patience=PATIENCE, factor=0.5, verbose=True)
+        scheduler = ReduceLROnPlateau(optimizer, patience=PATIENCE, factor=0.6)
+    elif SCHEDULER == "CosineAnnealingLR":
+        # Decays LR from initial value to eta_min over NUM_EPOCHS
+        scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-7)
     else:
         raise Exception("Scheduler not found... Choose between: ReduceLROnPlateau")
 
@@ -380,6 +407,5 @@ if __name__ == "__main__":
             print(f"Test Loss: {test_loss:.2f}", file=f)
             print(f"Total Trainable Params: {total_params}", file=f)
             print(f"Model Path: {save_model_path}", file=f)
-        
-        
-    
+
+

@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 from timeit import default_timer as timer
@@ -9,6 +8,8 @@ from torch import nn
 import utilities
 import csv
 import matplotlib.pyplot as plt
+import json
+
 from sklearn.model_selection import KFold
 ## -----------------------------------------------------------------------------------------------------------------##
 ##                                               TRAINING with GRADIENT ACCUMULATION                                                      ##
@@ -27,7 +28,7 @@ def train_step(model: torch.nn.Module,
 
     # Setup train loss value
     train_loss = 0.0
-
+    
     # Loop through data loader data batches
     for batch, data in enumerate(dataloader):
 
@@ -43,20 +44,21 @@ def train_step(model: torch.nn.Module,
             y = heatmaps_tensor.to(device)
         else:
             y = landmarks_tensor.to(device)
+        
 
-        #print(f"Batch {batch} - image tensor:  {X.shape} - GT tensor: {y.shape}")
+        # print(f"Batch {batch} - image tensor:  {X.shape} - GT tensor: {y.shape}")
 
         # Forward pass
         y_pred = model(X)
 
-        #print(f"y pred shape: {y_pred.shape} - y shape: {y.shape}")
+        # print(f"y pred shape: {y_pred.shape} - y shape: {y.shape}")
         
         # Calculate  and accumulate loss
         loss = loss_fn(y_pred, y)
 
         # normalize loss to account for batch accumulation
         loss = loss / gradient_accumulation_steps
-        train_loss += loss.item()
+        train_loss += loss.item() * gradient_accumulation_steps # Correcting loss reporting scale
 
         # Loss backward
         loss.backward()
@@ -67,6 +69,10 @@ def train_step(model: torch.nn.Module,
             optimizer.step()
             # Reset gradients
             optimizer.zero_grad()
+
+        # Print progress every 10 batches
+        if (batch + 1) % 10 == 0:
+            print(f"Batch {batch + 1}/{len(dataloader)} | Loss: {loss.item() * gradient_accumulation_steps:.6f}")
 
     # Adjust metrics to get average loss and accuracy per batch
     train_loss /= len(dataloader)
@@ -110,6 +116,10 @@ def validate_step(model: torch.nn.Module,
             # Calculate and accumulate loss
             loss = loss_fn(val_pred_logits, y)
             val_loss += loss.item()
+
+            # Print progress every 10 batches
+            if (batch + 1) % 10 == 0:
+                print(f"Validation Batch {batch + 1}/{len(dataloader)}")
 
     # Adjust metrics to get average loss per batch
     val_loss = val_loss / len(dataloader)
@@ -241,24 +251,29 @@ def train_and_validate(model: torch.nn.Module,
     # Create EarlyStopping instance
     early_stopping = EarlyStopping(patience=patience, save_path=save_path, counter=epochs_without_improvement, best_val_loss=best_val_loss)
 
+    # Track LR per epoch
+    lrs_per_epoch = []
+
     # Loop through training and validating steps for a number of epochs
     for epoch in tqdm(range(start_epoch, epochs + 1)):
-
+        print("entered epoch loop DEBPUGG")
         assert useGradAcc >= 1, "Gradient accumulation steps must be greater than 1"
 
         train_loss = train_step(model, device, train_dataloader, loss_fn, optimizer, useHeatmaps, gradient_accumulation_steps=useGradAcc)
-
         val_loss = validate_step(model, device, val_dataloader, loss_fn, useHeatmaps)
 
         scheduler_type = scheduler.__class__.__name__
         if scheduler_type == "ReduceLROnPlateau":
             scheduler.step(val_loss)
         else:
-            # Update the learning rate using the scheduler
             scheduler.step()
 
+        # Capture current LR (first param group)
+        current_lr = optimizer.param_groups[0]["lr"]
+        lrs_per_epoch.append(current_lr)
+
         # Print out what's happening
-        print(f"Epoch {epoch} | Train Loss: {train_loss:.7f} | Validation Loss: {val_loss:.7f}")
+        print(f"Epoch {epoch} | Train Loss: {train_loss:.7f} | Validation Loss: {val_loss:.7f} | LR: {current_lr:.6e}")
 
         # Update results dictionary
         results["train_loss"].append(train_loss)
@@ -277,6 +292,12 @@ def train_and_validate(model: torch.nn.Module,
     # End the timer and print out how long it took
     end_time = timer()
     print(f"Total training time: {end_time - start_time:.3f} seconds")
+
+    # Persist curves
+    try:
+        _save_training_curves(results, lrs_per_epoch, save_path or "./")
+    except Exception as e:
+        print(f"Warning: failed to save training curves: {e}")
 
     # Return the filled results at the end of the epochs
     return results
@@ -365,7 +386,6 @@ def test_step(model: torch.nn.Module,
               useHeatmaps: bool = False,
               sigma: int = 1.5,
               load_path: str = None):
-    
     # Take the baseline of the path
     if load_path is not None:
         model_dir = os.path.dirname(load_path)
@@ -386,11 +406,13 @@ def test_step(model: torch.nn.Module,
         for batch, data in enumerate(dataloader):
             images_name = data['name']
             images_tensor = data['image']
-            #image_size = images_tensor.numpy().shape[2:]
             landmarks_tensor = data['landmarks']
             heatmaps_tensor = data['heatmaps']
             original_size = data['original_size']
             resized_size = data['resized_size']
+            spacing_tensor = data['spacing'] if 'spacing' in data else None  # LUNA16 provides spacing
+            # NEW: number of valid landmarks per sample
+            num_valid_batch = data['num_valid_landmarks'] if 'num_valid_landmarks' in data else None
 
             # Send data to target device
             X = images_tensor.to(device)
@@ -407,26 +429,53 @@ def test_step(model: torch.nn.Module,
             loss = loss_fn(y_pred, y)
             test_loss += loss.item()
 
-            # Move the prediction and the GT to the CPU
+            # Move prediction to CPU numpy
             y_pred = y_pred.cpu()
 
-            # Save the prediction heatmaps as images in the model directory 
-            #os.makedirs(f"{model_dir}/predictions", exist_ok=True)
-            #utilities.save_heatmaps(X, y_pred, images_name, f"{model_dir}/predictions")                
+            # Decide if GT heatmaps are fused
+            fused_flag = False
+            if useHeatmaps:
+                # Shapes:
+                # 2D non‑fused: (B, N, H, W)
+                # 2D fused:     (B, 1, H, W) or (B, H, W)
+                # 3D non‑fused: (B, N, D, H, W)
+                # 3D fused:     (B, 1, D, H, W) or (B, D, H, W)
+                gt_shape = tuple(heatmaps_tensor.shape)
+                if heatmaps_tensor.ndim >= 3:
+                    if heatmaps_tensor.ndim in (4, 5):
+                        channels_dim = 1
+                        if gt_shape[channels_dim] != num_landmarks:
+                            fused_flag = True
+                    elif heatmaps_tensor.ndim in (3,):
+                        fused_flag = True
+            else:
+                fused_flag = False  # keypoint-regression path should compute keypoint mAP
 
-            # Compute the MSE and mAP between the original landmarks and the predicted landmarks
-            mse_list, mAP_list_heatmaps, mAP_list_keypoints, iou_list, distance_list = metrics.compute_batch_metrics(landmarks_tensor, heatmaps_tensor, y_pred, resized_size, num_landmarks, useHeatmaps, sigma)
-            # Append to full list in order to compute the MRE and SDR for all the images
+            # Compute metrics
+            mse_list, mAP_list_heatmaps, mAP_list_keypoints, iou_list, distance_list = metrics.compute_batch_metrics(
+                landmarks_tensor,
+                heatmaps_tensor,
+                y_pred,
+                resized_size,
+                num_landmarks,
+                useHeatmaps,
+                sigma,
+                spacing_batch=spacing_tensor,
+                fused=fused_flag,
+                num_valid_batch=num_valid_batch  # NEW: filter padded landmarks
+            )
+            # Append to full list for MRE/SDR
             distances.extend(distance_list)
             
             # Store image names as keys and their corresponding predictions as values.
-            for i, name in enumerate(images_name):  # Since they are in batch I loop them
-                # Storing prediction and metrics values
+            for i, name in enumerate(images_name):
+                # Keypoint mAP may be undefined when fused; guard it
+                map2_val = mAP_list_keypoints[i] if (not fused_flag and i < len(mAP_list_keypoints)) else float('nan')
                 results[name] = { 
                     'prediction': y_pred[i],
                     'mse': mse_list[i],
                     'map1': mAP_list_heatmaps[i],
-                    'map2': mAP_list_keypoints[i],
+                    'map2': map2_val,
                     'iou': iou_list[i]
                 }
 
@@ -437,12 +486,6 @@ def test_step(model: torch.nn.Module,
     test_loss = test_loss / len(dataloader)
 
     # Compute metrics on full list
-    #print("Dist shape:", len(distances))
-    #print("Mean distance:", np.mean(distances))
-    #print("Std distance:", np.std(distances))
-    #print("Distances under 3px:", len([i for i in distances if i < 3]))
-    #print("Distances above 15px:", len([i for i in distances if i > 15]))
-    
     mre = metrics.compute_mre(distances)
     sdr = metrics.compute_sdr(distances)
 
@@ -461,8 +504,6 @@ def evaluate(model: torch.nn.Module,
           res_file_path: str = "results/readable_res.csv"):
     
     checkpoint = torch.load(load_path, map_location=torch.device(device))
-    #model.load_state_dict(checkpoint['model'])
-
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"\nModel loaded from {load_path}")
     epoch = checkpoint.get('epoch', "Undefined")
@@ -470,28 +511,35 @@ def evaluate(model: torch.nn.Module,
     # Get the loss and the predictions dictionary
     test_loss, results, mre, sdr = test_step(model, device, test_dataloader, loss_fn, num_landmarks, useHeatmaps, sigma, load_path)
 
+    # Determine experiment dir to drop artifacts
+    exp_dir = os.path.dirname(load_path) if load_path else "./"
+    try:
+        _save_testing_curves(results, mre, sdr, exp_dir, prefix="validation" if "val" in exp_dir.lower() else "test")
+    except Exception as e:
+        print(f"Warning: failed to save testing curves: {e}")
+
     total_mse_list = []
     total_mAP_heatmaps_list = []
     total_mAP_keypoints_list = []
     total_iou_list = []
 
-    # Create a list with all metrics of all images
+    # Collect metrics of all images
     for value in results.values():
         total_mse_list.append(value['mse'])
         total_mAP_heatmaps_list.append(value['map1'])
         total_mAP_keypoints_list.append(value['map2'])
         total_iou_list.append(value['iou'])
 
-    # Compute the mean between all samples
+    # Means (ignore NaNs for keypoint mAP when fused)
     total_mse_mean = np.mean(total_mse_list)
     total_mAP_heatmaps_mean = np.mean(total_mAP_heatmaps_list)
-    total_mAP_keypoints_mean = np.mean(total_mAP_keypoints_list)
+    total_mAP_keypoints_mean = np.nanmean(total_mAP_keypoints_list)
     total_iou_mean = np.mean(total_iou_list)
 
-    # Compute the standard deviation between all samples
+    # STDs
     total_mse_std = np.std(total_mse_list)
     total_mAP_heatmaps_std = np.std(total_mAP_heatmaps_list)
-    total_mAP_keypoints_std = np.std(total_mAP_keypoints_list)
+    total_mAP_keypoints_std = np.nanstd(total_mAP_keypoints_list)
     total_iou_std = np.std(total_iou_list)
 
     # Create a string representation of the sdr dictionary
@@ -641,11 +689,13 @@ def k_fold_train_and_validate(model: torch.nn.Module,
             del fold_train_results, last_train_loss, last_val_loss, train_loader, train_subsampler, val_subsampler, train_ids, val_ids
 
 
-        # ---------------------- Evaluate performances on val set (the training never has seen the images on the val set, it use only to minimize error) -------------------------------
+        # ---------------------- Evaluate performances on val set -------------------------------
         load_fold_path = os.path.join(save_fold_path, f"best_checkpoint.pt")
-        # Get the loss and the predictions dictionary
-        test_loss, results, mre, sdr, mse, mAP_heatmaps, mAP_keypoints, iou, epoch = evaluate(model, device, val_loader, loss_fn, load_fold_path, 
-                                        num_landmarks, sigma, res_file_path=log_file)        
+        # FIX: pass useHeatmaps explicitly and sigma correctly
+        test_loss, results, mre, sdr, mse, mAP_heatmaps, mAP_keypoints, iou, epoch = evaluate(
+            model, device, val_loader, loss_fn, load_fold_path,
+            num_landmarks=num_landmarks, useHeatmaps=True, sigma=sigma, res_file_path=log_file
+        )
 
         k_test_losses.append(test_loss)
         
@@ -722,4 +772,95 @@ def k_fold_train_and_validate(model: torch.nn.Module,
         f"MRE ---> Mean: {k_mre_mean:.2f} | Std: {k_mre_std:.2f} \n",
         f"SDR:\n",
         *(f"Threshold {threshold}: Mean: {mean*100:.2f} | Std: {std*100:.2f}\n" for threshold, (mean, std) in sdr_mean_std.items()))
-    del k_train_losses, k_val_losses, k_test_losses, k_mse, k_iou, k_map_heat, k_map_key, k_mre, k_sdr, results_folds, train_dataset, total_size, fold_size, indices    
+    del k_train_losses, k_val_losses, k_test_losses, k_mse, k_iou, k_map_heat, k_map_key, k_mre, k_sdr, results_folds, train_dataset, total_size, fold_size, indices
+
+def _save_training_curves(results, lrs_per_epoch, save_path):
+    os.makedirs(save_path, exist_ok=True)
+    # Save JSON + CSV
+    with open(os.path.join(save_path, "training_results.json"), "w") as f:
+        json.dump({"train_loss": results["train_loss"], "val_loss": results["val_loss"], "lr": lrs_per_epoch}, f, indent=2)
+    with open(os.path.join(save_path, "training_results.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "val_loss", "lr"])
+        for i in range(len(results["train_loss"])):
+            writer.writerow([i + 1, results["train_loss"][i], results["val_loss"][i], lrs_per_epoch[i] if i < len(lrs_per_epoch) else ""])
+
+    # Plot Loss curves
+    plt.figure(figsize=(8,5))
+    plt.plot(range(1, len(results["train_loss"])+1), results["train_loss"], label="Train")
+    plt.plot(range(1, len(results["val_loss"])+1), results["val_loss"], label="Val")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Training/Validation Loss"); plt.legend(); plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, "loss_curves.png"))
+    plt.close()
+
+    # Plot LR curve
+    if lrs_per_epoch:
+        plt.figure(figsize=(8,5))
+        plt.plot(range(1, len(lrs_per_epoch)+1), lrs_per_epoch)
+        plt.xlabel("Epoch"); plt.ylabel("Learning Rate"); plt.title("Learning Rate per Epoch"); plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, "lr_curve.png"))
+        plt.close()
+
+def _save_testing_curves(results_dict, mre, sdr, save_path, prefix="test"):
+    os.makedirs(save_path, exist_ok=True)
+
+    # Flatten lists
+    mse = [v['mse'] for v in results_dict.values()]
+    map_heat = [v['map1'] for v in results_dict.values()]
+    map_key = [v['map2'] for v in results_dict.values() if not (v['map2'] is None or (isinstance(v['map2'], float) and str(v['map2'])=='nan'))]
+    iou = [v['iou'] for v in results_dict.values()]
+
+    # Save CSV per-image
+    with open(os.path.join(save_path, f"{prefix}_per_image_metrics.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image", "mse", "mAP_heat", "mAP_key", "iou"])
+        for k, v in results_dict.items():
+            writer.writerow([k, v['mse'], v['map1'], v['map2'], v['iou']])
+
+    # Save summary JSON
+    summary = {
+        "mre": float(mre),
+        "sdr": {str(k): float(v) for k, v in sdr.items()},
+        "mse_mean": float(np.mean(mse)) if mse else None,
+        "mAP_heat_mean": float(np.mean(map_heat)) if map_heat else None,
+        "mAP_key_mean": float(np.nanmean(map_key)) if map_key else None,
+        "iou_mean": float(np.mean(iou)) if iou else None
+    }
+    with open(os.path.join(save_path, f"{prefix}_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # Histograms/Boxplots
+    def _hist(data, name, bins=20):
+        if not data: return
+        plt.figure(figsize=(7,4))
+        plt.hist(data, bins=bins, alpha=0.8, color="#3b82f6")
+        plt.title(f"{name} Histogram"); plt.xlabel(name); plt.ylabel("Count"); plt.grid(True, alpha=0.2)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, f"{prefix}_{name.lower()}_hist.png"))
+        plt.close()
+    def _box(data, name):
+        if not data: return
+        plt.figure(figsize=(5,5))
+        plt.boxplot(data, vert=True)
+        plt.title(f"{name} Boxplot")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, f"{prefix}_{name.lower()}_box.png"))
+        plt.close()
+
+    _hist(mse, "MSE"); _box(mse, "MSE")
+    _hist(map_heat, "mAP_heat"); _box(map_heat, "mAP_heat")
+    _hist(map_key, "mAP_key"); _box(map_key, "mAP_key")
+    _hist(iou, "IoU"); _box(iou, "IoU")
+
+    # SDR bar chart
+    if sdr:
+        thresholds = [str(k) for k in sorted(sdr.keys())]
+        values = [sdr[k] for k in sorted(sdr.keys())]
+        plt.figure(figsize=(8,5))
+        plt.bar(thresholds, np.array(values)*100.0, color="#10b981")
+        plt.title("SDR (%) by threshold"); plt.xlabel("Threshold"); plt.ylabel("SDR (%)"); plt.grid(True, alpha=0.2, axis='y')
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, f"{prefix}_sdr_bar.png"))
+        plt.close()
